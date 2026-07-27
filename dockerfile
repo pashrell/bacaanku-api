@@ -1,40 +1,28 @@
-FROM python:3.11-slim
+# Menggunakan base image Python 3.10 versi slim agar ukuran image lebih kecil
+FROM python:3.10-slim
 
+# Menentukan direktori kerja di dalam container
 WORKDIR /app
 
-# Dependensi sistem minimal yang dibutuhkan onnxruntime/torch CPU
+# Menginstal dependensi sistem dasar yang sering dibutuhkan oleh library C++ / Machine Learning
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# Menyalin file requirements dan menginstal dependensi Python
 COPY requirements.txt .
-
-# Install torch CPU-only DI BARIS TERPISAH dari requirements.txt.
-# Kalau --extra-index-url ditaruh di dalam requirements.txt bersama
-# pandas/numpy/dll, pip akan mencoba resolve SEMUA paket lewat kedua
-# index sekaligus -> sering memicu metadata-generation-failed (pip
-# terpaksa build sdist pandas dari source karena bingung versi/index).
-RUN pip install --no-cache-dir torch==2.4.1+cpu --index-url https://download.pytorch.org/whl/cpu
-
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- PENTING: export & cache model SAAT BUILD, bukan saat container start ---
-# Ini memastikan:
-# 1. Container tidak perlu akses internet ke HuggingFace saat cold start
-#    (Railway free/hobby tier bisa gagal/lambat kalau harus download ~470MB tiap deploy)
-# 2. Model sudah dalam format ONNX (ringan, tanpa perlu torch runtime penuh saat inference)
-RUN python -c "\
-from sentence_transformers import SentenceTransformer; \
-m = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', backend='onnx'); \
-m.save_pretrained('./onnx_model')"
+# [PENTING] Melakukan pre-download model SBERT saat proses build Docker.
+# Ini mencegah server Railway timeout akibat mengunduh model saat startup.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', backend='onnx')"
 
-COPY main.py .
-COPY dataset_jaklitera_processed.pkl .
-COPY tfidf_artifacts.joblib .
-COPY sbert_embeddings.joblib .
+# Menyalin seluruh sisa file proyek (kode, dataset, dan artefak model) ke dalam container
+COPY . .
 
-ENV PORT=8000
+# Mengekspos port 8000 (meskipun Railway akan menimpa ini dengan variabel $PORT)
 EXPOSE 8000
 
-# Railway inject $PORT otomatis, uvicorn baca dari env
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]
+# Perintah untuk menjalankan server menggunakan Uvicorn.
+# Railway secara otomatis menyuntikkan variabel environment $PORT.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

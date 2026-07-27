@@ -11,11 +11,12 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 
 # ==========================================
-# 2. LOAD ARTEFAK RINGAN (aman di-load saat import, ukurannya kecil)
+# 1. LOAD ARTEFAK RINGAN (Aman diload di awal)
 # ==========================================
 print("Memuat dataset dan artefak ML...")
 df = pd.read_pickle('dataset_jaklitera_processed.pkl')
-has_desc_mask = df['has_desc']
+# Jadikan array numpy (.values) agar cepat saat operasi vektor / Late Fusion
+has_desc_mask = df['has_desc'].values 
 
 artifacts = joblib.load('tfidf_artifacts.joblib')
 vec_judul = artifacts['vec_judul']
@@ -29,54 +30,49 @@ mat_penulis = artifacts['mat_penulis']
 sbert_embeddings = joblib.load('sbert_embeddings.joblib')
 print("✅ Artefak ringan siap.")
 
+
 # ==========================================
-# 1b. LAZY-LOAD SBERT LEWAT LIFESPAN
-# ------------------------------------------
-# Model SBERT (bagian TERBESAR & TERBERAT dari aplikasi ini) dipindah ke
-# lifespan startup, bukan di top-level module. Ini penting untuk Railway:
-# - Kalau load gagal (mis. RAM sementara terbatas saat cold start),
-#   error muncul jelas di log startup, bukan crash tak jelas saat import.
-# - Model diambil dari folder ./onnx_model (hasil export saat Docker build),
-#   BUKAN download ulang dari HuggingFace saat runtime -> startup jauh lebih
-#   cepat & tidak bergantung koneksi internet container saat cold start.
-# - backend="onnx": bobot & arsitektur model SAMA PERSIS (tidak ada
-#   perubahan model / tidak menurunkan evaluasi), hanya runtime inference-nya
-#   yang lebih ringan dibanding torch penuh.
+# 2. LAZY-LOAD SBERT LEWAT LIFESPAN (Beban Memori Paling Berat)
 # ==========================================
 ml_models = {}
 
+# Konfigurasi ini memungkinkan deployment membaca model dari folder lokal terlebih dahulu.
+# Sangat krusial untuk server produksi yang sering mengalami timeout jika harus download ulang.
 ONNX_MODEL_PATH = "./onnx_model"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Memuat model NLP Multilingual (ONNX backend)...")
     if os.path.isdir(ONNX_MODEL_PATH):
+        # Gunakan model lokal jika folder onnx_model tersedia
         ml_models["sbert"] = SentenceTransformer(ONNX_MODEL_PATH, backend="onnx")
     else:
-        # Fallback kalau folder onnx_model belum ada (mis. saat dev lokal
-        # tanpa build Docker) -> tetap jalan, hanya lebih lambat saat start.
+        # Fallback download dari HuggingFace (backend onnx tetap aktif)
         ml_models["sbert"] = SentenceTransformer(
             'paraphrase-multilingual-MiniLM-L12-v2', backend="onnx"
         )
-    print("✅ Server API Siap!")
+    print("✅ Server API Siap & Model NLP telah dimuat!")
     yield
+    # Bebaskan memori saat server dimatikan
     ml_models.clear()
 
+
 # ==========================================
-# 1. SETUP APLIKASI & CORS (Untuk koneksi Frontend)
+# 3. SETUP APLIKASI & CORS
 # ==========================================
 app = FastAPI(title="Sistem Rekomendasi Jaklitera API", version="1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Ganti dengan domain frontend Anda saat production (misal: "http://localhost:3000")
+    allow_origins=["*"],  # Ganti dengan domain frontend Anda saat production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # ==========================================
-# 3. FUNGSI UTILITAS & SCHEMA REQUEST
+# 4. FUNGSI UTILITAS & SCHEMA REQUEST
 # ==========================================
 def clean_text(text: str) -> str:
     if pd.isna(text) or str(text).strip() == '': return ''
@@ -96,8 +92,9 @@ class StoryRequest(BaseModel):
 def health_check():
     return {"status": "ok", "model_loaded": "sbert" in ml_models}
 
+
 # ==========================================
-# 4. ENDPOINT MODEL 1: ITEM-TO-ITEM
+# 5. ENDPOINT MODEL 1: ITEM-TO-ITEM
 # ==========================================
 @app.post("/api/v1/recommend/catalog")
 def recommend_by_catalog(req: ItemRequest):
@@ -135,15 +132,19 @@ def recommend_by_catalog(req: ItemRequest):
     
     return {"status": "success", "buku_acuan": buku_acuan, "kategori_pencarian": "Item-to-Item", "data": results.to_dict(orient='records')}
 
+
 # ==========================================
-# 5. ENDPOINT MODEL 2: SEMANTIC SEARCH
+# 6. ENDPOINT MODEL 2: SEMANTIC SEARCH
 # ==========================================
 @app.post("/api/v1/recommend/semantic")
 def recommend_by_semantic(req: StoryRequest):
     cleaned_query = clean_text(req.cerita)
     
+    # Ambil model dari lifespan
+    sbert_model = ml_models["sbert"]
+    
     # Vektorisasi
-    query_embedding = ml_models["sbert"].encode([cleaned_query])
+    query_embedding = sbert_model.encode([cleaned_query])
     query_tfidf_desc = vec_desc.transform([cleaned_query])
     query_tfidf_judul = vec_judul.transform([cleaned_query])
     query_tfidf_kategori = vec_kategori.transform([cleaned_query])
@@ -158,18 +159,16 @@ def recommend_by_semantic(req: StoryRequest):
     
     sim_tfidf_fallback = (sim_tfidf_judul + sim_tfidf_kategori) / 2.0
 
-    # Late Fusion Model 2
-    final_scores = np.zeros(len(df))
-    for i in range(len(df)):
-        if has_desc_mask.iloc[i]:
-            final_scores[i] = (0.7 * sim_sbert[i]) + (0.3 * sim_tfidf_desc[i])
-        else:
-            final_scores[i] = sim_tfidf_fallback[i] * 0.6
+    # Late Fusion Model 2 (Vektorisasi penuh dengan numpy, tanpa for-loop)
+    final_scores = np.where(
+        has_desc_mask, 
+        (0.7 * sim_sbert) + (0.3 * sim_tfidf_desc), 
+        sim_tfidf_fallback * 0.6
+    )
 
     top_indices = final_scores.argsort()[::-1][:req.top_n]
     
     results = df.iloc[top_indices][['Judul', 'Penulis','Deskripsi', 'Kategori_Asal', 'Cover_URL']].copy()
     results['Skor_Relevansi'] = final_scores[top_indices].round(3)
     
-    # Hanya kembalikan berdasarkan data dataset lokal (dataset_jaklitera_processed)
     return {"status": "success", "kategori_pencarian": "Semantic", "data": results.to_dict(orient='records')}
