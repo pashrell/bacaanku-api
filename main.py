@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -5,24 +6,12 @@ import joblib
 import pandas as pd
 import numpy as np
 import re
+import os
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 
 # ==========================================
-# 1. SETUP APLIKASI & CORS (Untuk koneksi Frontend)
-# ==========================================
-app = FastAPI(title="Sistem Rekomendasi Jaklitera API", version="1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Ganti dengan domain frontend Anda saat production (misal: "http://localhost:3000")
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ==========================================
-# 2. LOAD ARTEFAK KE MEMORI (Berjalan saat server start)
+# 2. LOAD ARTEFAK RINGAN (aman di-load saat import, ukurannya kecil)
 # ==========================================
 print("Memuat dataset dan artefak ML...")
 df = pd.read_pickle('dataset_jaklitera_processed.pkl')
@@ -38,10 +27,53 @@ mat_kategori = artifacts['mat_kategori']
 mat_penulis = artifacts['mat_penulis']
 
 sbert_embeddings = joblib.load('sbert_embeddings.joblib')
+print("✅ Artefak ringan siap.")
 
-print("Memuat model NLP Multilingual...")
-sbert_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-print("✅ Server API Siap!")
+# ==========================================
+# 1b. LAZY-LOAD SBERT LEWAT LIFESPAN
+# ------------------------------------------
+# Model SBERT (bagian TERBESAR & TERBERAT dari aplikasi ini) dipindah ke
+# lifespan startup, bukan di top-level module. Ini penting untuk Railway:
+# - Kalau load gagal (mis. RAM sementara terbatas saat cold start),
+#   error muncul jelas di log startup, bukan crash tak jelas saat import.
+# - Model diambil dari folder ./onnx_model (hasil export saat Docker build),
+#   BUKAN download ulang dari HuggingFace saat runtime -> startup jauh lebih
+#   cepat & tidak bergantung koneksi internet container saat cold start.
+# - backend="onnx": bobot & arsitektur model SAMA PERSIS (tidak ada
+#   perubahan model / tidak menurunkan evaluasi), hanya runtime inference-nya
+#   yang lebih ringan dibanding torch penuh.
+# ==========================================
+ml_models = {}
+
+ONNX_MODEL_PATH = "./onnx_model"
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("Memuat model NLP Multilingual (ONNX backend)...")
+    if os.path.isdir(ONNX_MODEL_PATH):
+        ml_models["sbert"] = SentenceTransformer(ONNX_MODEL_PATH, backend="onnx")
+    else:
+        # Fallback kalau folder onnx_model belum ada (mis. saat dev lokal
+        # tanpa build Docker) -> tetap jalan, hanya lebih lambat saat start.
+        ml_models["sbert"] = SentenceTransformer(
+            'paraphrase-multilingual-MiniLM-L12-v2', backend="onnx"
+        )
+    print("✅ Server API Siap!")
+    yield
+    ml_models.clear()
+
+# ==========================================
+# 1. SETUP APLIKASI & CORS (Untuk koneksi Frontend)
+# ==========================================
+app = FastAPI(title="Sistem Rekomendasi Jaklitera API", version="1.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Ganti dengan domain frontend Anda saat production (misal: "http://localhost:3000")
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ==========================================
 # 3. FUNGSI UTILITAS & SCHEMA REQUEST
@@ -59,6 +91,10 @@ class ItemRequest(BaseModel):
 class StoryRequest(BaseModel):
     cerita: str
     top_n: int = 10
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "model_loaded": "sbert" in ml_models}
 
 # ==========================================
 # 4. ENDPOINT MODEL 1: ITEM-TO-ITEM
@@ -107,7 +143,7 @@ def recommend_by_semantic(req: StoryRequest):
     cleaned_query = clean_text(req.cerita)
     
     # Vektorisasi
-    query_embedding = sbert_model.encode([cleaned_query])
+    query_embedding = ml_models["sbert"].encode([cleaned_query])
     query_tfidf_desc = vec_desc.transform([cleaned_query])
     query_tfidf_judul = vec_judul.transform([cleaned_query])
     query_tfidf_kategori = vec_kategori.transform([cleaned_query])
