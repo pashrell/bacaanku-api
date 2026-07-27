@@ -1,4 +1,19 @@
-fastapi
-uvicorn
-sentence-transformers
-torch
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.5.1
+joblib==1.4.2
+
+# --- PENTING: torch CPU-only, JANGAN pakai "torch" polos dari PyPI ---
+# torch versi default (dari PyPI) menarik paket CUDA (~2GB+) yang tidak
+# dibutuhkan sama sekali di Railway (tidak ada GPU). Baris di bawah
+# memaksa pip mengambil build CPU-only (~200-300MB).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.4.1+cpu
+
+sentence-transformers==3.1.1
+# optimum + onnxruntime dibutuhkan untuk backend="onnx" di SentenceTransformer
+optimum[onnxruntime]==1.22.0
+onnxruntime==1.19.2
