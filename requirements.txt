@@ -6,12 +6,11 @@ numpy==1.26.4
 scikit-learn==1.5.1
 joblib==1.4.2
 
-# --- PENTING: torch CPU-only, JANGAN pakai "torch" polos dari PyPI ---
-# torch versi default (dari PyPI) menarik paket CUDA (~2GB+) yang tidak
-# dibutuhkan sama sekali di Railway (tidak ada GPU). Baris di bawah
-# memaksa pip mengambil build CPU-only (~200-300MB).
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.4.1+cpu
+# CATATAN: torch TIDAK ditaruh di sini secara sengaja.
+# torch CPU-only diinstall di baris RUN terpisah pada Dockerfile,
+# supaya --extra-index-url PyTorch tidak "bocor" ke resolusi paket
+# lain (pandas, numpy, dll) yang bisa memaksa pip build dari source
+# dan gagal (metadata-generation-failed).
 
 sentence-transformers==3.1.1
 # optimum + onnxruntime dibutuhkan untuk backend="onnx" di SentenceTransformer

@@ -8,6 +8,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+
+# Install torch CPU-only DI BARIS TERPISAH dari requirements.txt.
+# Kalau --extra-index-url ditaruh di dalam requirements.txt bersama
+# pandas/numpy/dll, pip akan mencoba resolve SEMUA paket lewat kedua
+# index sekaligus -> sering memicu metadata-generation-failed (pip
+# terpaksa build sdist pandas dari source karena bingung versi/index).
+RUN pip install --no-cache-dir torch==2.4.1+cpu --index-url https://download.pytorch.org/whl/cpu
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 # --- PENTING: export & cache model SAAT BUILD, bukan saat container start ---
